@@ -1,19 +1,16 @@
-from flask import Flask, request, jsonify
-from functools import wraps
+import json
 import io
 import re
 import time
 import cloudscraper
 import fitz
-import pymupdf4llm
 import google.generativeai as genai
 from google.generativeai import types
 import os
-
-app = Flask(__name__)
+import traceback
 
 # Configuration
-API_KEY = os.environ.get('API_KEY', 'your-secret-api-key-here')
+API_KEY = os.environ.get('API_KEY', 'secret-api-key')
 GEMINI_API_KEY = os.environ.get('GEMINI_API_KEY')
 
 if not GEMINI_API_KEY:
@@ -23,33 +20,6 @@ else:
     genai.configure(api_key=GEMINI_API_KEY)
 
 print(f"API_KEY for authentication: {API_KEY}")
-
-# API Key Authentication Decorator
-def require_api_key(f):
-    @wraps(f)
-    def decorated_function(*args, **kwargs):
-        auth_header = request.headers.get('Authorization')
-        
-        if not auth_header:
-            return jsonify({
-                "error": "Missing API key",
-                "message": "Please provide an API key in the Authorization header"
-            }), 401
-        
-        if auth_header.startswith('Bearer '):
-            provided_key = auth_header[7:]
-        else:
-            provided_key = auth_header
-        
-        if provided_key != API_KEY:
-            return jsonify({
-                "error": "Invalid API key",
-                "message": "The provided API key is not valid"
-            }), 403
-        
-        return f(*args, **kwargs)
-    
-    return decorated_function
 
 # PDF Parsing Function
 def parse_pdf_from_url(pdf_url: str, write_images: bool = False) -> dict:
@@ -80,7 +50,6 @@ def parse_pdf_from_url(pdf_url: str, write_images: bool = False) -> dict:
             "message": str(e)
         }
 
-
 # Tool function mapping
 tool_functions = {"parse_pdf_from_url": parse_pdf_from_url}
 
@@ -107,19 +76,16 @@ pdf_tool = types.Tool(
         )
     ]
 )
-#pdf_tool = Tool(function_declarations=[pdf_parsing_declaration])
 
 def run_pdf_agent(user_prompt: str, system_prompt: str = None, max_iterations: int = 10):
-    """
-    Run Gemini agent with PDF parsing capability.
-    """
+    """Run Gemini agent with PDF parsing capability."""
     try:
-        # Initialize model with corrected tool
         model = genai.GenerativeModel(
             model_name='gemini-2.5-flash',
-            tools=[pdf_tool],  # Pass as list
+            tools=[pdf_tool],
             system_instruction=system_prompt if system_prompt else "You are a helpful assistant."
         )
+        generation_config = {"temperature": 0.1}
         
         chat = model.start_chat()
         iteration = 0
@@ -128,9 +94,8 @@ def run_pdf_agent(user_prompt: str, system_prompt: str = None, max_iterations: i
             iteration += 1
             print(f"Iteration {iteration}")
             
-            response = chat.send_message(user_prompt)
+            response = chat.send_message(user_prompt, generation_config=generation_config)
             
-            # Check for function calls
             has_function_call = False
             for part in response.candidates[0].content.parts:
                 if hasattr(part, 'function_call') and part.function_call:
@@ -143,12 +108,10 @@ def run_pdf_agent(user_prompt: str, system_prompt: str = None, max_iterations: i
                     print(f"Calling function: {fn_name}")
                     print(f"Arguments: {fn_args}")
                     
-                    # Execute the function
                     if fn_name in tool_functions:
                         result = tool_functions[fn_name](**fn_args)
                         print(f"Function result status: {result.get('status')}")
                         
-                        # Send result back to model
                         response = chat.send_message(
                             genai.protos.Content(
                                 parts=[
@@ -162,25 +125,24 @@ def run_pdf_agent(user_prompt: str, system_prompt: str = None, max_iterations: i
                             )
                         )
                         
-                        # Return the final text response
-                        return response.text
+                        for part in response.parts:
+                            if part.text:
+                                return part.text
+                            elif part.function_call:
+                                print(f"Model requested another function call: {part.function_call.name}")
             
-            # If no function call, return text
             if not has_function_call:
                 return response.text
-                
+            
         return "Max iterations reached"
         
     except Exception as e:
         print(f"Error in run_pdf_agent: {e}")
-        import traceback
         traceback.print_exc()
         raise
 
 def parse_response(text: str):
-    """
-    Parse the agent response to extract subject, content, and URL.
-    """
+    """Parse the agent response to extract subject, content, and URL."""
     subject_pattern = r'Subject:\s*(.+?)(?=\n\nContent:)'
     content_pattern = r'Content:\s*(.+)'
 
@@ -188,7 +150,7 @@ def parse_response(text: str):
     content_match = re.search(content_pattern, text, re.DOTALL)
 
     subject = subject_match.group(1).strip() if subject_match else ""
-    content = content_match.group(1).strip() if content_match else text  # Fallback to full text
+    content = content_match.group(1).strip() if content_match else text
     url = re.search(r'(https://[^\s]+)', text).group(1) if re.search(r'(https://[^\s]+)', text) else ""
 
     return {
@@ -198,37 +160,69 @@ def parse_response(text: str):
         "url": url
     }
 
-# API Endpoints
-@app.route('/health', methods=['GET'])
-def health_check():
-    """Health check endpoint for Cloud Run"""
-    return jsonify({"status": "healthy"}), 200
-
-@app.route('/api/parse-pdf', methods=['POST'])
-@require_api_key
-def parse_pdf():
-    """
-    Parse a PDF from URL and generate summary using Gemini.
-    """
+def lambda_handler(event, context):
+    """Main Lambda handler - directly processes API Gateway events."""
+    print(f"Received event: {json.dumps(event, indent=2)}")
+    
     try:
-        data = request.get_json()
-        print(f"\n--- Received Request ---")
-        print(f"Data: {data}")
+        # Extract Authorization header
+        auth_header = None
+        if 'headers' in event:
+            auth_header = event['headers'].get('Authorization') or event['headers'].get('authorization')
+        
+        # Validate API key
+        if not auth_header:
+            return {
+                'statusCode': 401,
+                'headers': {'Content-Type': 'application/json'},
+                'body': json.dumps({
+                    "error": "Missing API key",
+                    "message": "Please provide an API key in the Authorization header"
+                })
+            }
+        
+        if auth_header.startswith('Bearer '):
+            provided_key = auth_header[7:]
+        else:
+            provided_key = auth_header
+        
+        if provided_key != API_KEY:
+            return {
+                'statusCode': 403,
+                'headers': {'Content-Type': 'application/json'},
+                'body': json.dumps({
+                    "error": "Invalid API key",
+                    "message": "The provided API key is not valid"
+                })
+            }
+        
+        # Get request body
+        body = event.get('body', '{}')
+        if isinstance(body, str):
+            data = json.loads(body)
+        else:
+            data = body
+        
+        print(f"Request data: {data}")
         
         if not data:
-            return jsonify({"error": "No JSON data provided"}), 400
+            return {
+                'statusCode': 400,
+                'headers': {'Content-Type': 'application/json'},
+                'body': json.dumps({"error": "No JSON data provided"})
+            }
         
         user_prompt = data.get('user_prompt')
         system_prompt = data.get('system_prompt', None)
         max_iterations = data.get('max_iterations', 10)
         
-        print(f"User prompt: {user_prompt}")
-        print(f"System prompt: {system_prompt}")
-        
         if not user_prompt:
-            return jsonify({"error": "user_prompt is required"}), 400
+            return {
+                'statusCode': 400,
+                'headers': {'Content-Type': 'application/json'},
+                'body': json.dumps({"error": "user_prompt is required"})
+            }
         
-        # Run the agent
         print("Running PDF agent...")
         result = run_pdf_agent(
             user_prompt=user_prompt,
@@ -236,70 +230,40 @@ def parse_pdf():
             max_iterations=max_iterations
         )
         
-        print(f"Agent result: {result[:200]}...")
-        
-        # Parse the response
+        print(f"Agent result: {result}...")
         parsed = parse_response(result)
         print(f"Parsed response: {parsed}")
         
-        return jsonify({
-            "status": "success",
-            "raw_response": result,
-            "parsed_response": parsed
-        }), 200
+        return {
+            'statusCode': 200,
+            'headers': {
+                'Content-Type': 'application/json',
+                'Access-Control-Allow-Origin': '*'
+            },
+            'body': json.dumps({
+                "status": "success",
+                "raw_response": result,
+                "parsed_response": parsed
+            })
+        }
         
+    except json.JSONDecodeError:
+        return {
+            'statusCode': 400,
+            'headers': {'Content-Type': 'application/json'},
+            'body': json.dumps({"error": "Invalid JSON in request body"})
+        }
     except Exception as e:
         print(f"ERROR: {str(e)}")
-        import traceback
         traceback.print_exc()
-        
-        return jsonify({
-            "status": "error",
-            "message": str(e),
-            "type": type(e).__name__
-        }), 500
+        return {
+            'statusCode': 500,
+            'headers': {'Content-Type': 'application/json'},
+            'body': json.dumps({
+                "status": "error",
+                "message": str(e),
+                "type": type(e).__name__
+            })
+        }
 
-@app.route('/api/parse-pdf-direct', methods=['POST'])
-@require_api_key
-def parse_pdf_direct():
-    """
-    Direct PDF parsing without agent.
-    """
-    try:
-        data = request.get_json()
-        
-        if not data:
-            return jsonify({"error": "No JSON data provided"}), 400
-        
-        pdf_url = data.get('pdf_url')
-        write_images = data.get('write_images', False)
-        
-        if not pdf_url:
-            return jsonify({"error": "pdf_url is required"}), 400
-        
-        result = parse_pdf_from_url(pdf_url, write_images)
-        
-        return jsonify(result), 200
-        
-    except Exception as e:
-        return jsonify({
-            "status": "error",
-            "message": str(e)
-        }), 500
 
-@app.route('/', methods=['GET'])
-def index():
-    """Root endpoint"""
-    return jsonify({
-        "message": "PDF Parser API",
-        "endpoints": {
-            "/health": "Health check",
-            "/api/parse-pdf": "Parse PDF with Gemini agent",
-            "/api/parse-pdf-direct": "Direct PDF parsing"
-        },
-        "authentication": "Required - Use Authorization header with API key"
-    }), 200
-
-if __name__ == '__main__':
-    port = int(os.environ.get('PORT', 8080))
-    app.run(host='0.0.0.0', port=port, debug=True)
